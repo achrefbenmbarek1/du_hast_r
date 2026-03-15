@@ -1,0 +1,18 @@
+{
+  "cache_dir": "/tmp/r-artifact-cache",
+  "concurrency": 8,
+  "packages": [
+    {
+      "package": "BiocGenerics",
+      "version": "0.50.0",
+      "urls": [
+        "https://bioconductor.org/packages/3.21/bioc/src/contrib/BiocGenerics_0.50.0.tar.gz"
+      ],
+      "checksum": {
+        "algorithm": "md5",
+        "value": "REPLACE_WITH_MD5_FROM_PACKAGES_METADATA"
+      },
+      "artifact_name": "BiocGenerics_0.50.0.tar.gz"
+    }
+  ]
+}

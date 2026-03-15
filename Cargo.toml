@@ -1,0 +1,24 @@
+[package]
+name = "async_dependency_installer_for_R"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "async_dependency_installer_for_r"
+
+[[bin]]
+name = "async_dependency_installer_for_R"
+path = "src/main.rs"
+
+[dependencies]
+futures = "0.3"
+hex = "0.4"
+md-5 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
