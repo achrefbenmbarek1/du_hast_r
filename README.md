@@ -87,6 +87,10 @@ In TUI mode, press `q` to abort while running, and after success the 100% screen
 Command-mode shortcuts:
 - `f` then `p`: package panel regex search (by package name)
 - `f` then `l`: log panel regex search
+- `v`: enter/leave log navigation mode (`j/k/h/l`, `gg`, `G`)
+- `V` in log mode: toggle selection mode on/off from current line
+- `y` in log mode: copy current line (or selected range if selection is on)
+- `E`: export captured logs to `du_hast_r_logs_<unix_ts>.log`
 - `Esc` or `Enter`: leave search mode
 
 Show full compiler/install logs when needed:

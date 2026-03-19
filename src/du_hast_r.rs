@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
 };
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -20,12 +20,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, IsTerminal, Stdout};
+use std::io::{BufRead, BufReader, IsTerminal, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MANIFEST: &str = "fer.json";
 const DEFAULT_LOCKFILE: &str = "nein.lock";
@@ -34,6 +34,7 @@ const RUNNER_SCRIPT: &str = "scripts/du_hast_r_runner.R";
 const EVENT_PREFIX: &str = "DHR_EVENT ";
 const MAX_LOG_LINES: usize = 160;
 const TUI_TICK: Duration = Duration::from_millis(100);
+const RESOURCE_TICK: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Parser)]
 #[command(name = "du_hast_r")]
@@ -200,6 +201,16 @@ struct TuiState {
     log_search: String,
     package_search_error: Option<String>,
     log_search_error: Option<String>,
+    g_prefix_pending: bool,
+    log_cursor: usize,
+    log_anchor: Option<usize>,
+    log_view_offset: usize,
+    log_selection_active: bool,
+    mem_total_bytes: Option<u64>,
+    mem_used_bytes: Option<u64>,
+    proc_rss_bytes: Option<u64>,
+    last_resource_refresh: Instant,
+    status_message: Option<String>,
     started: Instant,
     completed: bool,
 }
@@ -219,6 +230,7 @@ enum InputMode {
     Normal,
     PackageSearch,
     LogSearch,
+    LogVisual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +263,16 @@ impl TuiState {
             log_search: String::new(),
             package_search_error: None,
             log_search_error: None,
+            g_prefix_pending: false,
+            log_cursor: 0,
+            log_anchor: None,
+            log_view_offset: 0,
+            log_selection_active: false,
+            mem_total_bytes: None,
+            mem_used_bytes: None,
+            proc_rss_bytes: None,
+            last_resource_refresh: Instant::now() - RESOURCE_TICK,
+            status_message: None,
             started: Instant::now(),
             completed: false,
         }
@@ -259,9 +281,6 @@ impl TuiState {
     fn push_log(&mut self, entry: String) {
         self.track_package_from_line(&entry);
         self.logs.push_back(entry);
-        if self.logs.len() > MAX_LOG_LINES {
-            let _ = self.logs.pop_front();
-        }
     }
 
     fn track_package_from_line(&mut self, line: &str) {
@@ -302,6 +321,57 @@ impl TuiState {
             _ => 1,
         }
     }
+
+    fn maybe_refresh_resources(&mut self) {
+        if self.last_resource_refresh.elapsed() < RESOURCE_TICK {
+            return;
+        }
+        self.last_resource_refresh = Instant::now();
+        let (used, total) = read_system_memory();
+        self.mem_used_bytes = used;
+        self.mem_total_bytes = total;
+        self.proc_rss_bytes = read_process_rss();
+    }
+
+    fn filtered_log_indices(&self) -> Vec<usize> {
+        let log_filter = compile_regex(&self.log_search);
+        self.logs
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| log_filter.as_ref().is_none_or(|re| re.is_match(line)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn enter_visual_mode(&mut self, panel_height: usize) {
+        let filtered = self.filtered_log_indices();
+        if filtered.is_empty() {
+            self.status_message = Some("no logs available for visual mode".to_string());
+            return;
+        }
+        self.input_mode = InputMode::LogVisual;
+        self.g_prefix_pending = false;
+        let last = filtered.len().saturating_sub(1);
+        self.log_cursor = last;
+        self.log_anchor = None;
+        self.log_selection_active = false;
+        self.align_log_view_for_cursor(panel_height, filtered.len());
+        self.status_message = Some("log mode: move with j/k/h/l, select with V".to_string());
+    }
+
+    fn align_log_view_for_cursor(&mut self, panel_height: usize, total: usize) {
+        let page = panel_height.max(1);
+        if self.log_cursor < self.log_view_offset {
+            self.log_view_offset = self.log_cursor;
+        } else if self.log_cursor >= self.log_view_offset + page {
+            self.log_view_offset = self.log_cursor + 1 - page;
+        }
+        if total <= page {
+            self.log_view_offset = 0;
+        } else {
+            self.log_view_offset = self.log_view_offset.min(total - page);
+        }
+    }
 }
 
 struct TuiSession {
@@ -324,6 +394,15 @@ impl TuiSession {
             .draw(|frame| draw_tui(frame, state))
             .map_err(|e| format!("failed to draw terminal UI: {e}"))?;
         Ok(())
+    }
+
+    fn log_panel_rows(&self) -> usize {
+        let Ok(area) = self.terminal.size() else {
+            return 8;
+        };
+        let top = 3u16 + 11u16 + 8u16 + 3u16;
+        let body = area.height.saturating_sub(top);
+        body.saturating_sub(2) as usize
     }
 }
 
@@ -782,12 +861,15 @@ fn run_with_tui(command: &mut Command, mode: &str, verbose: bool) -> Result<Phas
         }
 
         state.metrics.total_seconds = Some(state.started.elapsed().as_secs_f64());
+        state.maybe_refresh_resources();
         session.draw(&state)?;
 
         if event::poll(TUI_TICK).map_err(|e| format!("failed to poll terminal input: {e}"))? {
             if let CEvent::Key(key) = event::read().map_err(|e| format!("failed to read terminal input: {e}"))?
             {
-                if key.kind == KeyEventKind::Press && handle_tui_key(&mut state, key.code) == KeyAction::Quit {
+                if key.kind == KeyEventKind::Press
+                    && handle_tui_key(&mut state, key.code, session.log_panel_rows()) == KeyAction::Quit
+                {
                     let _ = child.kill();
                     let details = if state.logs.is_empty() {
                         "<no command output captured>".to_string()
@@ -1070,13 +1152,15 @@ fn apply_event_tui(event: &RunnerEvent, state: &mut TuiState) {
     }
 }
 
-fn handle_tui_key(state: &mut TuiState, code: KeyCode) -> KeyAction {
+fn handle_tui_key(state: &mut TuiState, code: KeyCode, log_panel_rows: usize) -> KeyAction {
+    state.status_message = None;
     match state.input_mode {
         InputMode::PackageSearch => match code {
             KeyCode::Esc | KeyCode::Enter => {
                 state.input_mode = InputMode::Normal;
                 state.package_search_error = None;
                 state.f_prefix_pending = false;
+                state.g_prefix_pending = false;
             }
             KeyCode::Backspace => {
                 state.package_search.pop();
@@ -1093,6 +1177,7 @@ fn handle_tui_key(state: &mut TuiState, code: KeyCode) -> KeyAction {
                 state.input_mode = InputMode::Normal;
                 state.log_search_error = None;
                 state.f_prefix_pending = false;
+                state.g_prefix_pending = false;
             }
             KeyCode::Backspace => {
                 state.log_search.pop();
@@ -1104,26 +1189,126 @@ fn handle_tui_key(state: &mut TuiState, code: KeyCode) -> KeyAction {
             }
             _ => {}
         },
+        InputMode::LogVisual => {
+            let filtered_len = state.filtered_log_indices().len();
+            match code {
+                KeyCode::Esc | KeyCode::Char('v') => {
+                    state.input_mode = InputMode::Normal;
+                    state.log_anchor = None;
+                    state.log_selection_active = false;
+                    state.g_prefix_pending = false;
+                    state.status_message = Some("left log mode".to_string());
+                }
+                KeyCode::Char('q') => return KeyAction::Quit,
+                KeyCode::Char('V') => {
+                    state.g_prefix_pending = false;
+                    if state.log_selection_active {
+                        state.log_selection_active = false;
+                        state.log_anchor = None;
+                        state.status_message = Some("selection off".to_string());
+                    } else if filtered_len > 0 {
+                        state.log_selection_active = true;
+                        state.log_anchor = Some(state.log_cursor.min(filtered_len - 1));
+                        state.status_message = Some("selection on".to_string());
+                    }
+                }
+                KeyCode::Char('j') => {
+                    state.g_prefix_pending = false;
+                    if filtered_len > 0 {
+                        state.log_cursor = (state.log_cursor + 1).min(filtered_len - 1);
+                        state.align_log_view_for_cursor(log_panel_rows, filtered_len);
+                    }
+                }
+                KeyCode::Char('k') => {
+                    state.g_prefix_pending = false;
+                    state.log_cursor = state.log_cursor.saturating_sub(1);
+                    state.align_log_view_for_cursor(log_panel_rows, filtered_len);
+                }
+                KeyCode::Char('h') => {
+                    state.g_prefix_pending = false;
+                    state.log_cursor = state.log_cursor.saturating_sub(log_panel_rows.max(1));
+                    state.align_log_view_for_cursor(log_panel_rows, filtered_len);
+                }
+                KeyCode::Char('l') => {
+                    state.g_prefix_pending = false;
+                    if filtered_len > 0 {
+                        state.log_cursor =
+                            (state.log_cursor + log_panel_rows.max(1)).min(filtered_len - 1);
+                        state.align_log_view_for_cursor(log_panel_rows, filtered_len);
+                    }
+                }
+                KeyCode::Char('G') => {
+                    state.g_prefix_pending = false;
+                    if filtered_len > 0 {
+                        state.log_cursor = filtered_len - 1;
+                        state.align_log_view_for_cursor(log_panel_rows, filtered_len);
+                    }
+                }
+                KeyCode::Char('g') => {
+                    if state.g_prefix_pending {
+                        state.g_prefix_pending = false;
+                        state.log_cursor = 0;
+                        state.align_log_view_for_cursor(log_panel_rows, filtered_len);
+                    } else {
+                        state.g_prefix_pending = true;
+                    }
+                }
+                KeyCode::Char('y') => {
+                    state.g_prefix_pending = false;
+                    let copied = selected_log_text(state);
+                    match copy_to_clipboard(&copied) {
+                        Ok(_) => state.status_message = Some("copied logs to clipboard".to_string()),
+                        Err(e) => state.status_message = Some(format!("clipboard copy failed: {e}")),
+                    }
+                }
+                KeyCode::Char('E') => {
+                    state.g_prefix_pending = false;
+                    match export_logs_to_file(&state.logs) {
+                        Ok(path) => state.status_message = Some(format!("logs exported to {}", path.display())),
+                        Err(e) => state.status_message = Some(format!("failed to export logs: {e}")),
+                    }
+                }
+                _ => {
+                    state.g_prefix_pending = false;
+                }
+            }
+        }
         InputMode::Normal => match code {
             KeyCode::Char('q') => return KeyAction::Quit,
             KeyCode::Esc => {
                 state.f_prefix_pending = false;
+                state.g_prefix_pending = false;
             }
             KeyCode::Char('f') => {
                 state.f_prefix_pending = true;
+                state.g_prefix_pending = false;
             }
             KeyCode::Char('p') if state.f_prefix_pending => {
                 state.f_prefix_pending = false;
+                state.g_prefix_pending = false;
                 state.input_mode = InputMode::PackageSearch;
                 state.package_search_error = compile_regex_error(&state.package_search);
             }
             KeyCode::Char('l') if state.f_prefix_pending => {
                 state.f_prefix_pending = false;
+                state.g_prefix_pending = false;
                 state.input_mode = InputMode::LogSearch;
                 state.log_search_error = compile_regex_error(&state.log_search);
             }
+            KeyCode::Char('v') => {
+                state.f_prefix_pending = false;
+                state.enter_visual_mode(log_panel_rows);
+            }
+            KeyCode::Char('E') => {
+                state.f_prefix_pending = false;
+                match export_logs_to_file(&state.logs) {
+                    Ok(path) => state.status_message = Some(format!("logs exported to {}", path.display())),
+                    Err(e) => state.status_message = Some(format!("failed to export logs: {e}")),
+                }
+            }
             _ => {
                 state.f_prefix_pending = false;
+                state.g_prefix_pending = false;
             }
         },
     }
@@ -1160,6 +1345,120 @@ fn extract_pkg_from_tarball(line: &str) -> Option<String> {
     re.captures(line)
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().to_string())
+}
+
+fn selected_log_text(state: &TuiState) -> String {
+    let filtered = state.filtered_log_indices();
+    if filtered.is_empty() {
+        return String::new();
+    }
+    let cursor = state.log_cursor.min(filtered.len() - 1);
+    let anchor = if state.log_selection_active {
+        state.log_anchor.unwrap_or(cursor).min(filtered.len() - 1)
+    } else {
+        cursor
+    };
+    let (start, end) = if anchor <= cursor {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+    let mut out = Vec::new();
+    for idx in start..=end {
+        let original = filtered[idx];
+        if let Some(line) = state.logs.get(original) {
+            out.push(line.clone());
+        }
+    }
+    out.join("\n")
+}
+
+fn export_logs_to_file(logs: &VecDeque<String>) -> Result<PathBuf, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("time error: {e}"))?
+        .as_secs();
+    let path = PathBuf::from(format!("du_hast_r_logs_{stamp}.log"));
+    let body = logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("no log selection to copy".to_string());
+    }
+    let mut attempts: Vec<Vec<&str>> = Vec::new();
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        attempts.push(vec!["wl-copy"]);
+    }
+    if std::env::var("DISPLAY").is_ok() {
+        attempts.push(vec!["xclip", "-selection", "clipboard"]);
+        attempts.push(vec!["xsel", "--clipboard", "--input"]);
+    }
+    attempts.push(vec!["pbcopy"]);
+
+    let mut last_err = "no clipboard command available".to_string();
+    for cmd in attempts {
+        let mut child = match Command::new(cmd[0]).args(&cmd[1..]).stdin(Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("spawn {} failed: {e}", cmd[0]);
+                continue;
+            }
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                last_err = format!("write {} stdin failed: {e}", cmd[0]);
+                let _ = child.kill();
+                continue;
+            }
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_err = format!("{} exited with {}", cmd[0], status),
+            Err(e) => last_err = format!("wait {} failed: {e}", cmd[0]),
+        }
+    }
+    Err(last_err)
+}
+
+fn read_system_memory() -> (Option<u64>, Option<u64>) {
+    let text = match fs::read_to_string("/proc/meminfo") {
+        Ok(t) => t,
+        Err(_) => return (None, None),
+    };
+    let total_kb = parse_meminfo_kb(&text, "MemTotal:");
+    let avail_kb = parse_meminfo_kb(&text, "MemAvailable:");
+    match (total_kb, avail_kb) {
+        (Some(total), Some(avail)) => {
+            let used = total.saturating_sub(avail);
+            (Some(used * 1024), Some(total * 1024))
+        }
+        _ => (None, None),
+    }
+}
+
+fn parse_meminfo_kb(content: &str, key: &str) -> Option<u64> {
+    for line in content.lines() {
+        if !line.starts_with(key) {
+            continue;
+        }
+        let val = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|n| n.parse::<u64>().ok());
+        if val.is_some() {
+            return val;
+        }
+    }
+    None
+}
+
+fn read_process_rss() -> Option<u64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    let kb = parse_meminfo_kb(&text, "VmRSS:")?;
+    Some(kb * 1024)
 }
 
 fn draw_tui(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
@@ -1246,6 +1545,24 @@ fn draw_tui(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         active_threads, state.core_count
     ))];
     thread_lines.push(Line::from(format!("overall est utilization: {:>5.1}%", overall_util)));
+    thread_lines.push(Line::from(format!(
+        "ram used/total: {} / {}",
+        state
+            .mem_used_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "--".to_string()),
+        state
+            .mem_total_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "--".to_string())
+    )));
+    thread_lines.push(Line::from(format!(
+        "du_hast_r rss: {}",
+        state
+            .proc_rss_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "--".to_string())
+    )));
     thread_lines.extend(core_lines);
     let thread_panel = Paragraph::new(thread_lines).block(
         Block::default()
@@ -1287,24 +1604,70 @@ fn draw_tui(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     frame.render_widget(packages, bottom[0]);
 
     let log_filter = compile_regex(&state.log_search);
-    let filtered_logs: Vec<&String> = state
+    let filtered_indices = state
         .logs
         .iter()
-        .filter(|line| log_filter.as_ref().is_none_or(|re| re.is_match(line)))
-        .collect();
+        .enumerate()
+        .filter(|(_, line)| log_filter.as_ref().is_none_or(|re| re.is_match(line)))
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
     let visible_logs = bottom[1].height.saturating_sub(2) as usize;
-    let start_idx = filtered_logs.len().saturating_sub(visible_logs);
-    let log_items: Vec<ListItem<'_>> = filtered_logs[start_idx..]
-        .iter()
-        .map(|line| ListItem::new((*line).clone()))
-        .collect();
+    let total_filtered = filtered_indices.len();
+    let (start_idx, cursor_opt, anchor_opt) = if state.input_mode == InputMode::LogVisual && total_filtered > 0 {
+        let cursor = state.log_cursor.min(total_filtered - 1);
+        let page = visible_logs.max(1);
+        let max_start = total_filtered.saturating_sub(page);
+        let start = state.log_view_offset.min(max_start);
+        let anchor = if state.log_selection_active {
+            state.log_anchor
+                .map(|a| a.min(total_filtered - 1))
+                .or(Some(cursor))
+        } else {
+            None
+        };
+        (start, Some(cursor), anchor)
+    } else {
+        (total_filtered.saturating_sub(visible_logs), None, None)
+    };
+    let end_idx = (start_idx + visible_logs).min(total_filtered);
+    let mut log_items: Vec<ListItem<'_>> = Vec::new();
+    for i in start_idx..end_idx {
+        let original = filtered_indices[i];
+        let Some(line) = state.logs.get(original) else {
+            continue;
+        };
+        let mut style = Style::default();
+        if let (Some(cursor), Some(anchor)) = (cursor_opt, anchor_opt) {
+            let (sel_start, sel_end) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
+            if i >= sel_start && i <= sel_end {
+                style = style.bg(Color::DarkGray).fg(Color::White);
+            }
+        }
+        if let Some(cursor) = cursor_opt {
+            if i == cursor {
+                style = style
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD);
+            }
+        }
+        log_items.push(ListItem::new(line.clone()).style(style));
+    }
     let log_title = if state.log_search.trim().is_empty() {
         "Logs".to_string()
     } else {
         format!("Logs (regex: {})", state.log_search)
     };
     let logs = List::new(log_items).block(Block::default().title(log_title).borders(Borders::ALL));
-    frame.render_widget(logs, bottom[1]);
+    if let Some(cursor) = cursor_opt {
+        let mut list_state = ListState::default();
+        if cursor >= start_idx && cursor < end_idx {
+            list_state.select(Some(cursor - start_idx));
+        }
+        frame.render_stateful_widget(logs, bottom[1], &mut list_state);
+    } else {
+        frame.render_widget(logs, bottom[1]);
+    }
 
     let footer_text = match state.input_mode {
         InputMode::PackageSearch => format!(
@@ -1329,11 +1692,25 @@ fn draw_tui(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
             if state.f_prefix_pending {
                 "command mode: f + p (package search), f + l (log search), q (quit)".to_string()
             } else if state.completed {
-                "completed at 100% | q (quit) | f then p/l search panels".to_string()
+                "completed at 100% | q quit | v visual logs | f+p/f+l search | E export logs".to_string()
             } else {
-                "q (abort), f then p (package search), f then l (log search)".to_string()
+                "q abort | v visual logs | f then p/l search | E export logs".to_string()
             }
         }
+        InputMode::LogVisual => {
+            if state.log_selection_active {
+                "LOG SELECT: j/k/h/l move, gg top, G end, V toggle off, y copy, E export, v/esc exit"
+                    .to_string()
+            } else {
+                "LOG NAV: j/k/h/l move, gg top, G end, V start selection, y copy line, E export, v/esc exit"
+                    .to_string()
+            }
+        }
+    };
+    let footer_text = if let Some(status) = &state.status_message {
+        format!("{footer_text} | {status}")
+    } else {
+        footer_text
     };
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -1343,12 +1720,15 @@ fn draw_tui(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
 
 fn wait_for_q_to_exit(session: &mut TuiSession, state: &mut TuiState) -> Result<(), String> {
     loop {
+        state.maybe_refresh_resources();
         session.draw(state)?;
         if event::poll(TUI_TICK).map_err(|e| format!("failed to poll terminal input: {e}"))? {
             if let CEvent::Key(key) =
                 event::read().map_err(|e| format!("failed to read terminal input: {e}"))?
             {
-                if key.kind == KeyEventKind::Press && handle_tui_key(state, key.code) == KeyAction::Quit {
+                if key.kind == KeyEventKind::Press
+                    && handle_tui_key(state, key.code, session.log_panel_rows()) == KeyAction::Quit
+                {
                     return Ok(());
                 }
             }
