@@ -234,6 +234,7 @@ if (mode == "lock") {
   }
 
   target_lib <- resolve_install_library(lib)
+  emit_event("install", "target", lib = target_lib, message = sprintf("installing into %s", target_lib))
   old_makeflags <- Sys.getenv("MAKEFLAGS", unset = NA_character_)
   if (!is.null(make_jobs)) {
     Sys.setenv(MAKEFLAGS = sprintf("-j%d", as.integer(make_jobs)))

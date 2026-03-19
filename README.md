@@ -77,6 +77,14 @@ Install from lockfile (`gefragt` is the install verb):
 du_hast_r gefragt fer.json
 ```
 
+Use full-screen TUI mode:
+
+```bash
+du_hast_r --tui gefragt fer.json
+```
+
+In TUI mode, press `q` to abort while running, and after success the 100% screen stays open until you press `q` to exit.
+
 Show full compiler/install logs when needed:
 
 ```bash
@@ -112,7 +120,8 @@ Example `fer.json`:
   "settings": {
     "download_threads": 16,
     "install_ncpus": 4,
-    "make_jobs": 4
+    "make_jobs": 4,
+    "lib": "/path/to/your/R/library"
   },
   "dependencies": {
     "BiocGenerics": "0.56.0",
@@ -121,6 +130,11 @@ Example `fer.json`:
   }
 }
 ```
+
+Install location precedence for `du_hast_r gefragt`:
+- `settings.lib` in `fer.json` (if set and writable)
+- then current `.libPaths()`
+- then `R_LIBS_USER`
 
 ## R orchestration
 

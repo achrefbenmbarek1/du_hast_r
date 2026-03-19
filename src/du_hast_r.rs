@@ -1,12 +1,25 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Generator};
+use crossterm::{
+    event::{self, Event as CEvent, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -19,6 +32,7 @@ const DEFAULT_FETCHER: &str = "./target/debug/async_dependency_installer_for_R";
 const RUNNER_SCRIPT: &str = "scripts/du_hast_r_runner.R";
 const EVENT_PREFIX: &str = "DHR_EVENT ";
 const MAX_LOG_LINES: usize = 160;
+const TUI_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(name = "du_hast_r")]
@@ -26,6 +40,8 @@ const MAX_LOG_LINES: usize = 160;
 struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
+    #[arg(long, global = true, help = "Render install progress in a full-screen terminal UI")]
+    tui: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -140,6 +156,8 @@ struct RunnerEvent {
     cache_hit_rate: Option<f64>,
     #[serde(default)]
     total_seconds: Option<f64>,
+    #[serde(default)]
+    lib: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +168,7 @@ struct PhaseMetrics {
     downloaded_bytes: Option<u64>,
     reused_bytes: Option<u64>,
     cache_hit_rate: Option<f64>,
+    install_lib: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,6 +176,73 @@ struct UiPhaseState {
     resolve_done: bool,
     fetch_done: bool,
     install_done: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TuiState {
+    mode: String,
+    phase_message: String,
+    resolve_pct: u16,
+    fetch_pct: u16,
+    install_pct: u16,
+    metrics: PhaseMetrics,
+    logs: VecDeque<String>,
+    started: Instant,
+    completed: bool,
+}
+
+impl TuiState {
+    fn new(mode: &str) -> Self {
+        Self {
+            mode: mode.to_string(),
+            phase_message: "waiting for planner events".to_string(),
+            resolve_pct: 3,
+            fetch_pct: 3,
+            install_pct: 3,
+            metrics: PhaseMetrics::default(),
+            logs: VecDeque::new(),
+            started: Instant::now(),
+            completed: false,
+        }
+    }
+
+    fn push_log(&mut self, entry: String) {
+        self.logs.push_back(entry);
+        if self.logs.len() > MAX_LOG_LINES {
+            let _ = self.logs.pop_front();
+        }
+    }
+}
+
+struct TuiSession {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TuiSession {
+    fn enter() -> Result<Self, String> {
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen)
+            .map_err(|e| format!("failed to enter alternate screen: {e}"))?;
+        enable_raw_mode().map_err(|e| format!("failed to enable raw mode: {e}"))?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend).map_err(|e| format!("failed to open terminal UI: {e}"))?;
+        Ok(Self { terminal })
+    }
+
+    fn draw(&mut self, state: &TuiState) -> Result<(), String> {
+        self.terminal
+            .draw(|frame| draw_tui(frame, state))
+            .map_err(|e| format!("failed to draw terminal UI: {e}"))?;
+        Ok(())
+    }
+}
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 impl Default for ManifestSettings {
@@ -209,6 +295,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
+    let tui = cli.tui;
 
     match cli.command {
         Commands::Init { manifest, force } => cmd_init(&manifest, force),
@@ -216,20 +303,20 @@ fn run() -> Result<(), String> {
             manifest,
             lockfile,
             fetcher,
-        } => cmd_lock(&manifest, &lockfile, &fetcher, verbose),
+        } => cmd_lock(&manifest, &lockfile, &fetcher, verbose, tui),
         Commands::Gefragt {
             manifest,
             lockfile,
             fetcher,
             no_lock_write,
-        } => cmd_gefragt(&manifest, &lockfile, &fetcher, no_lock_write, verbose),
+        } => cmd_gefragt(&manifest, &lockfile, &fetcher, no_lock_write, verbose, tui),
         Commands::Nein {
             package,
             manifest,
             lock,
             lockfile,
             fetcher,
-        } => cmd_nein(&package, &manifest, lock, &lockfile, &fetcher, verbose),
+        } => cmd_nein(&package, &manifest, lock, &lockfile, &fetcher, verbose, tui),
         Commands::Import {
             from,
             manifest,
@@ -259,10 +346,11 @@ fn cmd_lock(
     lockfile_path: &Path,
     fetcher_path: &Path,
     verbose: bool,
+    tui: bool,
 ) -> Result<(), String> {
     let manifest = read_manifest(manifest_path)?;
     validate_manifest(&manifest)?;
-    let metrics = run_runner("lock", manifest_path, lockfile_path, fetcher_path, verbose)?;
+    let metrics = run_runner("lock", manifest_path, lockfile_path, fetcher_path, verbose, tui)?;
     attach_manifest_hash(lockfile_path, manifest_path)?;
     println!("LOCKED {}", lockfile_path.display());
     print_metrics(metrics);
@@ -275,6 +363,7 @@ fn cmd_gefragt(
     fetcher_path: &Path,
     no_lock_write: bool,
     verbose: bool,
+    tui: bool,
 ) -> Result<(), String> {
     let manifest = read_manifest(manifest_path)?;
     validate_manifest(&manifest)?;
@@ -286,11 +375,11 @@ fn cmd_gefragt(
                 lockfile_path.display()
             ));
         }
-        cmd_lock(manifest_path, lockfile_path, fetcher_path, verbose)?;
+        cmd_lock(manifest_path, lockfile_path, fetcher_path, verbose, tui)?;
     }
 
     validate_lock_manifest_hash(lockfile_path, manifest_path)?;
-    let metrics = run_runner("install", manifest_path, lockfile_path, fetcher_path, verbose)?;
+    let metrics = run_runner("install", manifest_path, lockfile_path, fetcher_path, verbose, tui)?;
     println!("DONE gefragt using {}", lockfile_path.display());
     print_metrics(metrics);
     Ok(())
@@ -303,6 +392,7 @@ fn cmd_nein(
     lockfile_path: &Path,
     fetcher_path: &Path,
     verbose: bool,
+    tui: bool,
 ) -> Result<(), String> {
     let mut manifest = read_manifest(manifest_path)?;
     if manifest.dependencies.remove(package).is_none() {
@@ -320,7 +410,7 @@ fn cmd_nein(
 
     println!("REMOVED {} from {}", package, manifest_path.display());
     if lock {
-        cmd_lock(manifest_path, lockfile_path, fetcher_path, verbose)?;
+        cmd_lock(manifest_path, lockfile_path, fetcher_path, verbose, tui)?;
     }
     Ok(())
 }
@@ -416,9 +506,14 @@ fn run_runner(
     lockfile_path: &Path,
     fetcher_path: &Path,
     verbose: bool,
+    tui: bool,
 ) -> Result<PhaseMetrics, String> {
     let mut cmd = build_runner_command(mode, manifest_path, lockfile_path, fetcher_path);
-    run_with_multibar(&mut cmd, verbose)
+    if tui && std::io::stdout().is_terminal() {
+        run_with_tui(&mut cmd, mode, verbose)
+    } else {
+        run_with_multibar(&mut cmd, verbose)
+    }
 }
 
 fn run_with_multibar(command: &mut Command, verbose: bool) -> Result<PhaseMetrics, String> {
@@ -551,6 +646,117 @@ fn run_with_multibar(command: &mut Command, verbose: bool) -> Result<PhaseMetric
     }
 }
 
+fn run_with_tui(command: &mut Command, mode: &str, verbose: bool) -> Result<PhaseMetrics, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture stderr".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+    let tx_out = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx_out.send((false, line));
+        }
+    });
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx.send((true, line));
+        }
+    });
+
+    let mut state = TuiState::new(mode);
+    let mut session = TuiSession::enter()?;
+    session.draw(&state)?;
+
+    loop {
+        while let Ok((is_stderr, line)) = rx.try_recv() {
+            if let Some(event) = parse_event(&line) {
+                apply_event_tui(&event, &mut state);
+            } else if !line.trim().is_empty() {
+                let entry = if is_stderr {
+                    format!("[stderr] {line}")
+                } else {
+                    line
+                };
+                state.push_log(entry);
+            }
+        }
+
+        state.metrics.total_seconds = Some(state.started.elapsed().as_secs_f64());
+        session.draw(&state)?;
+
+        if event::poll(TUI_TICK).map_err(|e| format!("failed to poll terminal input: {e}"))? {
+            if let CEvent::Key(key) = event::read().map_err(|e| format!("failed to read terminal input: {e}"))?
+            {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+                    let _ = child.kill();
+                    let details = if state.logs.is_empty() {
+                        "<no command output captured>".to_string()
+                    } else {
+                        state.logs.iter().cloned().collect::<Vec<_>>().join("\n")
+                    };
+                    return Err(format!("run cancelled by user\n{details}"));
+                }
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                while let Ok((is_stderr, line)) = rx.try_recv() {
+                    if parse_event(&line).is_none() && !line.trim().is_empty() {
+                        let entry = if is_stderr {
+                            format!("[stderr] {line}")
+                        } else {
+                            line
+                        };
+                        state.push_log(entry);
+                    }
+                }
+
+                if status.success() {
+                    state.resolve_pct = 100;
+                    state.fetch_pct = 100;
+                    state.install_pct = 100;
+                    state.phase_message = "all phases complete".to_string();
+                    state.completed = true;
+                    state.metrics.total_seconds = Some(state.started.elapsed().as_secs_f64());
+                    session.draw(&state)?;
+                    wait_for_q_to_exit(&mut session, &state)?;
+                    drop(session);
+                    if verbose {
+                        for line in state.logs {
+                            println!("{line}");
+                        }
+                    }
+                    return Ok(state.metrics);
+                }
+
+                drop(session);
+                let details = if state.logs.is_empty() {
+                    "<no command output captured>".to_string()
+                } else {
+                    state.logs.into_iter().collect::<Vec<_>>().join("\n")
+                };
+                return Err(format!("runner failed with status {status}\n{details}"));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                drop(session);
+                return Err(format!("failed while waiting for runner process: {e}"));
+            }
+        }
+    }
+}
+
 fn phase_spinner(prefix: &str, msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     let style = ProgressStyle::with_template(
@@ -642,6 +848,14 @@ fn apply_event(
             install_pb.set_position(8);
             install_pb.set_message(format!("{} layers", event.layers.unwrap_or(0)));
         }
+        ("install", "target") => {
+            if let Some(lib) = &event.lib {
+                metrics.install_lib = Some(lib.clone());
+            }
+            if let Some(msg) = &event.message {
+                install_pb.set_message(msg.clone());
+            }
+        }
         ("install", "progress") => {
             let done = event.completed_packages.unwrap_or(0);
             let total = event.total_packages.unwrap_or(1).max(1);
@@ -670,6 +884,211 @@ fn apply_event(
     }
 }
 
+fn apply_event_tui(event: &RunnerEvent, state: &mut TuiState) {
+    match (event.phase.as_str(), event.status.as_str()) {
+        ("resolve", "start") => {
+            state.resolve_pct = 15;
+            state.phase_message = format!("resolving {} roots", event.total_roots.unwrap_or(0));
+        }
+        ("resolve", "done") => {
+            state.resolve_pct = 100;
+            state.phase_message = format!(
+                "resolved {} packages in {:.2}s",
+                event.packages.unwrap_or(0),
+                event.seconds.unwrap_or(0.0)
+            );
+        }
+        ("fetch", "start") => {
+            state.fetch_pct = 14;
+            state.phase_message = format!("fetch started ({} threads)", event.threads.unwrap_or(0));
+        }
+        ("fetch", "done") => {
+            state.fetch_pct = 100;
+            let secs = event.seconds.unwrap_or(0.0);
+            let dl = event.downloaded_bytes.unwrap_or(0);
+            let reused = event.reused_bytes.unwrap_or(0);
+            let hit = event.cache_hit_rate.unwrap_or(0.0) * 100.0;
+            state.phase_message = format!(
+                "fetched in {:.2}s | dl {} | reused {} | {:.1}% cache",
+                secs,
+                human_bytes(dl),
+                human_bytes(reused),
+                hit
+            );
+            state.metrics.fetch_seconds = Some(secs);
+            state.metrics.downloaded_bytes = Some(dl);
+            state.metrics.reused_bytes = Some(reused);
+            state.metrics.cache_hit_rate = Some(event.cache_hit_rate.unwrap_or(0.0));
+        }
+        ("install", "start") => {
+            state.install_pct = 8;
+            state.phase_message = format!("install started ({} layers)", event.layers.unwrap_or(0));
+        }
+        ("install", "target") => {
+            if let Some(lib) = &event.lib {
+                state.metrics.install_lib = Some(lib.clone());
+            }
+            if let Some(msg) = &event.message {
+                state.phase_message = msg.clone();
+            }
+        }
+        ("install", "progress") => {
+            let done = event.completed_packages.unwrap_or(0);
+            let total = event.total_packages.unwrap_or(1).max(1);
+            let pct = ((done as f64 / total as f64) * 100.0).round() as u16;
+            state.install_pct = pct.min(99);
+            state.phase_message = format!(
+                "layer {}/{} | pkg {}/{}",
+                event.layer.unwrap_or(0),
+                event.layers.unwrap_or(0),
+                done,
+                total
+            );
+        }
+        ("install", "done") => {
+            state.install_pct = 100;
+            state.metrics.install_seconds = event.seconds;
+            state.phase_message = format!("install complete in {:.2}s", event.seconds.unwrap_or(0.0));
+        }
+        ("done", "done") => {
+            state.metrics.total_seconds = event.total_seconds;
+            state.phase_message = "all phases complete".to_string();
+        }
+        _ => {
+            if let Some(msg) = &event.message {
+                state.phase_message = msg.clone();
+            }
+        }
+    }
+}
+
+fn draw_tui(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(11),
+            Constraint::Length(7),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("du_hast_r ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("| "),
+        Span::styled(
+            format!("mode: {}", state.mode),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::raw(state.phase_message.as_str()),
+    ]))
+    .block(Block::default().title("Status").borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    let gauges = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Length(3)])
+        .split(chunks[1]);
+    frame.render_widget(
+        gauge_widget("Resolve", state.resolve_pct, Color::Blue),
+        gauges[0],
+    );
+    frame.render_widget(gauge_widget("Fetch", state.fetch_pct, Color::Cyan), gauges[1]);
+    frame.render_widget(
+        gauge_widget("Install", state.install_pct, Color::Magenta),
+        gauges[2],
+    );
+
+    let stats = vec![
+        Line::from(format!(
+            "total: {:>7}  fetch: {:>7}  install: {:>7}",
+            format_secs(state.metrics.total_seconds),
+            format_secs(state.metrics.fetch_seconds),
+            format_secs(state.metrics.install_seconds)
+        )),
+        Line::from(format!(
+            "downloaded: {:>10}  reused: {:>10}  cache hit: {:>6}",
+            human_bytes(state.metrics.downloaded_bytes.unwrap_or(0)),
+            human_bytes(state.metrics.reused_bytes.unwrap_or(0)),
+            format_percent(state.metrics.cache_hit_rate)
+        )),
+        Line::from(format!(
+            "library: {}",
+            state
+                .metrics
+                .install_lib
+                .clone()
+                .unwrap_or_else(|| "--".to_string())
+        )),
+    ];
+    let stats_panel =
+        Paragraph::new(stats).block(Block::default().title("Metrics").borders(Borders::ALL));
+    frame.render_widget(stats_panel, chunks[2]);
+
+    let log_items: Vec<ListItem<'_>> = state
+        .logs
+        .iter()
+        .rev()
+        .take(chunks[3].height.saturating_sub(2) as usize)
+        .rev()
+        .map(|line| ListItem::new(line.clone()))
+        .collect();
+    let logs = List::new(log_items).block(Block::default().title("Logs").borders(Borders::ALL));
+    frame.render_widget(logs, chunks[3]);
+
+    let footer_text = if state.completed {
+        "completed at 100% | press q to exit"
+    } else {
+        "q: abort run"
+    };
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default());
+    frame.render_widget(footer, chunks[4]);
+}
+
+fn wait_for_q_to_exit(session: &mut TuiSession, state: &TuiState) -> Result<(), String> {
+    loop {
+        session.draw(state)?;
+        if event::poll(TUI_TICK).map_err(|e| format!("failed to poll terminal input: {e}"))? {
+            if let CEvent::Key(key) =
+                event::read().map_err(|e| format!("failed to read terminal input: {e}"))?
+            {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn gauge_widget<'a>(label: &'a str, pct: u16, color: Color) -> Gauge<'a> {
+    Gauge::default()
+        .block(Block::default().title(label).borders(Borders::ALL))
+        .gauge_style(
+            Style::default()
+                .fg(color)
+                .bg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .percent(pct.min(100))
+        .label(format!("{:>3}%", pct.min(100)))
+}
+
+fn format_secs(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.2}s"))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn format_percent(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "--".to_string())
+}
+
 fn print_metrics(metrics: PhaseMetrics) {
     if let Some(total) = metrics.total_seconds {
         println!(
@@ -681,6 +1100,9 @@ fn print_metrics(metrics: PhaseMetrics) {
             human_bytes(metrics.reused_bytes.unwrap_or(0)),
             metrics.cache_hit_rate.unwrap_or(0.0) * 100.0
         );
+    }
+    if let Some(lib) = metrics.install_lib {
+        println!("LIBRARY {}", lib);
     }
 }
 
