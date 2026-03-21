@@ -4,6 +4,10 @@ suppressPackageStartupMessages({
 
 source("R/async_install.R")
 
+`%||%` <- function(lhs, rhs) {
+  if (is.null(lhs)) rhs else lhs
+}
+
 args <- commandArgs(trailingOnly = TRUE)
 config_path <- if (length(args) >= 1) args[[1]] else "scripts/benchmark_config.json"
 out_dir <- if (length(args) >= 2) args[[2]] else file.path("benchmark_runs", format(Sys.time(), "%Y%m%d_%H%M%S"))
@@ -31,6 +35,57 @@ ensure_writable_dir <- function(path) {
     stop(sprintf("Directory is not writable: %s", path), call. = FALSE)
   }
   invisible(path)
+}
+
+parse_human_bytes <- function(value) {
+  if (is.null(value) || is.na(value) || !nzchar(value)) {
+    return(NA_real_)
+  }
+  m <- regexec("^([0-9]+(?:\\.[0-9]+)?)(B|KB|MB|GB|TB)$", trimws(value))
+  parts <- regmatches(value, m)[[1]]
+  if (length(parts) != 3) {
+    return(NA_real_)
+  }
+  amount <- as.numeric(parts[[2]])
+  unit <- parts[[3]]
+  scale <- switch(
+    unit,
+    B = 1,
+    KB = 1024,
+    MB = 1024^2,
+    GB = 1024^3,
+    TB = 1024^4,
+    NA_real_
+  )
+  amount * scale
+}
+
+parse_du_hast_summary <- function(lines) {
+  summary_line <- grep("^SUMMARY total=", lines, value = TRUE)
+  if (length(summary_line) == 0) {
+    stop("du_hast_r output did not contain a SUMMARY line", call. = FALSE)
+  }
+  line <- summary_line[[length(summary_line)]]
+  pattern <- paste0(
+    "^SUMMARY total=([0-9.]+)s fetch=([0-9.]+)s install=([0-9.]+)s ",
+    "downloaded=([^ ]+) reused=([^ ]+) cache_hit=([0-9.]+)%$"
+  )
+  m <- regexec(pattern, line)
+  parts <- regmatches(line, m)[[1]]
+  if (length(parts) != 7) {
+    stop(sprintf("could not parse du_hast_r SUMMARY line: %s", line), call. = FALSE)
+  }
+  list(
+    ok = TRUE,
+    total_seconds = as.numeric(parts[[2]]),
+    download_seconds = as.numeric(parts[[3]]),
+    install_seconds = as.numeric(parts[[4]]),
+    downloaded_bytes = parse_human_bytes(parts[[5]]),
+    reused_bytes = parse_human_bytes(parts[[6]]),
+    cache_hit_rate = as.numeric(parts[[7]]) / 100,
+    retry_count = 0L,
+    fetch_errors = 0L
+  )
 }
 
 free_space_bytes <- function(path) {
@@ -342,6 +397,64 @@ run_renv <- function(lockfile, env_paths, repos) {
   )
 }
 
+write_du_hast_manifest <- function(path,
+                                   packages,
+                                   lib_dir,
+                                   cache_dir,
+                                   dynamic_mode,
+                                   dynamic_enabled = TRUE) {
+  settings <- list(
+    dynamics = isTRUE(dynamic_enabled),
+    dynamic_mode = dynamic_mode,
+    download_threads = 16L,
+    install_ncpus = 2L,
+    make_jobs = 4L,
+    lib = normalizePath(lib_dir, winslash = "/", mustWork = FALSE),
+    cache_dir = normalizePath(cache_dir, winslash = "/", mustWork = FALSE),
+    repos = list()
+  )
+  dependencies <- as.list(rep("*", length(packages)))
+  names(dependencies) <- packages
+  manifest <- list(
+    name = basename(dirname(path)),
+    version = "0.1.0",
+    settings = settings,
+    dependencies = dependencies
+  )
+  write_json(manifest, path = path, pretty = TRUE, auto_unbox = TRUE, null = "null")
+}
+
+run_du_hast_cli <- function(packages, env_paths, cfg, dynamic_mode) {
+  cli <- cfg$du_hast_cli %||% "./target/debug/du_hast_r"
+  fetcher <- cfg$fetcher
+  manifest_path <- file.path(env_paths$project_dir, "fer.json")
+  lockfile_path <- file.path(env_paths$project_dir, "nein.lock")
+  ensure_writable_dir(env_paths$project_dir)
+  write_du_hast_manifest(
+    path = manifest_path,
+    packages = packages,
+    lib_dir = env_paths$lib_dir,
+    cache_dir = env_paths$cache_dir,
+    dynamic_mode = dynamic_mode,
+    dynamic_enabled = TRUE
+  )
+
+  args <- c(
+    "gefragt",
+    manifest_path,
+    "--lockfile",
+    lockfile_path,
+    "--fetcher",
+    fetcher
+  )
+  output <- system2(cli, args = args, stdout = TRUE, stderr = TRUE)
+  status <- attr(output, "status")
+  if (!is.null(status) && status != 0) {
+    stop(paste(output, collapse = "\n"), call. = FALSE)
+  }
+  parse_du_hast_summary(output)
+}
+
 run_single_scenario <- function(stack_name,
                                 packages,
                                 method,
@@ -419,6 +532,20 @@ run_single_scenario <- function(stack_name,
       )
     } else if (method == "renv") {
       run_renv(lockfile = lockfile, env_paths = env_paths, repos = repos)
+    } else if (method == "du_hast_dynamic_shared") {
+      run_du_hast_cli(
+        packages = packages,
+        env_paths = env_paths,
+        cfg = cfg,
+        dynamic_mode = "shared_server"
+      )
+    } else if (method == "du_hast_dynamic_dedicated") {
+      run_du_hast_cli(
+        packages = packages,
+        env_paths = env_paths,
+        cfg = cfg,
+        dynamic_mode = "dedicated_builder"
+      )
     } else {
       stop(sprintf("Unknown method: %s", method), call. = FALSE)
     }
@@ -556,7 +683,7 @@ run_benchmark <- function(config, out_dir) {
   ensure_writable_dir(benchmark_root)
 
   methods <- unlist(config$methods)
-  cache_states <- c("cold", "warm")
+  cache_states <- unlist(config$cache_states %||% list("cold", "warm"))
   repetitions <- as.integer(config$repetitions)
 
   results <- list()

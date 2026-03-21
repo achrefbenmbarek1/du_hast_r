@@ -225,6 +225,12 @@ Run the full benchmark:
 Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config.json
 ```
 
+Run the trimmed CLI dynamic benchmark against the real `du_hast_r gefragt` path:
+
+```bash
+Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_cli_dynamic.json
+```
+
 Summarize results:
 
 ```bash
