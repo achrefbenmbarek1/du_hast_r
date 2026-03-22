@@ -153,6 +153,7 @@ When `settings.dynamics` is `true`, those fixed values are ignored at runtime an
 
 - live-rebalanced download concurrency in the Rust fetcher
 - batch-level install scheduling in the R runner
+- memory- and swap-aware install throttling that can reduce `Ncpus` and `MAKEFLAGS` under pressure
 
 `settings.dynamic_mode` controls the heuristic bias:
 
@@ -231,6 +232,24 @@ Run the trimmed CLI dynamic benchmark against the real `du_hast_r gefragt` path:
 Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_cli_dynamic.json
 ```
 
+Run the heavy-only CLI dynamic benchmark with a safer tuned baseline for laptop-class machines:
+
+```bash
+Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_cli_dynamic_heavy.json
+```
+
+Run a realistic single-cell / Bioconductor CLI dynamic benchmark:
+
+```bash
+Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_cli_dynamic_singlecell.json
+```
+
+Run a tighter single-cell comparison focused on `tuned` versus `du_hast_dynamic_dedicated`:
+
+```bash
+Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_cli_dynamic_singlecell_dedicated.json
+```
+
 Summarize results:
 
 ```bash
@@ -242,6 +261,12 @@ Notes:
 - The benchmark runs cold and warm scenarios for each repetition.
 - Disk safety guard is controlled by `disk_guard.min_free_gb` in config.
 - Cleanup is sequential and enabled by default to reduce SSD pressure.
+- Results are checkpointed after each completed scenario, so partial runs still produce CSV/JSON output.
+- The heavy-only CLI dynamic config lowers the `tuned` baseline to `install_ncpus = 1` and `make_jobs = 2` to reduce OOM risk while leaving async modes adaptive.
+- Dynamic install scheduling now reacts to both RAM availability and swap usage, and may clamp `MAKEFLAGS` more aggressively than `Ncpus` on native-code-heavy batches.
+- Dynamic installs are chunked more finely than whole dependency layers, so `shared` and `dedicated` can raise or lower install parallelism more often between batches.
+- The dedicated mode now uses larger healthy-host install chunks and a higher healthy-host `MAKEFLAGS` cap than shared, while preserving the same low-memory backoff.
+- The single-cell CLI dynamic config models a more day-to-day computational neurobiology workflow than the Stan-heavy stress stack.
 - `renv` baseline requires the `renv` package to be installed.
 - Benchmark `renv` flows force `DOWNLOAD_STATIC_LIBV8=1` to avoid host-specific libv8 toolchain failures.
 

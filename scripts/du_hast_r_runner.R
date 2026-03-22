@@ -180,7 +180,9 @@ read_proc_meminfo <- function() {
   }
   list(
     total_bytes = extract_kb("MemTotal:"),
-    available_bytes = extract_kb("MemAvailable:")
+    available_bytes = extract_kb("MemAvailable:"),
+    swap_total_bytes = extract_kb("SwapTotal:"),
+    swap_free_bytes = extract_kb("SwapFree:")
   )
 }
 
@@ -206,25 +208,77 @@ probe_host_state <- function() {
     },
     loadavg_1 = read_proc_loadavg(),
     mem_total_bytes = if (is.null(meminfo)) NA_real_ else meminfo$total_bytes,
-    mem_available_bytes = if (is.null(meminfo)) NA_real_ else meminfo$available_bytes
+    mem_available_bytes = if (is.null(meminfo)) NA_real_ else meminfo$available_bytes,
+    swap_total_bytes = if (is.null(meminfo)) NA_real_ else meminfo$swap_total_bytes,
+    swap_free_bytes = if (is.null(meminfo)) NA_real_ else meminfo$swap_free_bytes
   )
 }
 
-memory_scale_for_mode <- function(mode, state) {
+host_pressure_for_mode <- function(mode, state) {
   if (is.na(state$mem_total_bytes) || is.na(state$mem_available_bytes) || state$mem_total_bytes <= 0) {
-    return(1)
+    return(list(
+      available_ratio = NA_real_,
+      swap_used_ratio = NA_real_,
+      swap_active = FALSE,
+      install_scale = 1,
+      make_scale = 1
+    ))
   }
   available_ratio <- state$mem_available_bytes / state$mem_total_bytes
-  if (mode == "shared_server") {
-    if (available_ratio < 0.10) return(0.25)
-    if (available_ratio < 0.20) return(0.50)
-    if (available_ratio < 0.35) return(0.75)
-    return(1)
+  swap_used_ratio <- NA_real_
+  swap_active <- FALSE
+  if (!is.na(state$swap_total_bytes) && state$swap_total_bytes > 0 &&
+      !is.na(state$swap_free_bytes) && state$swap_free_bytes >= 0) {
+    swap_used_ratio <- max(0, min(1, (state$swap_total_bytes - state$swap_free_bytes) / state$swap_total_bytes))
+    swap_active <- swap_used_ratio > 0.02
   }
-  if (available_ratio < 0.08) return(0.25)
-  if (available_ratio < 0.15) return(0.50)
-  if (available_ratio < 0.25) return(0.75)
-  1
+
+  install_scale <- 1
+  make_scale <- 1
+  if (mode == "shared_server") {
+    if (available_ratio < 0.10) {
+      install_scale <- 0.25
+      make_scale <- 0.25
+    } else if (available_ratio < 0.20) {
+      install_scale <- 0.50
+      make_scale <- 0.35
+    } else if (available_ratio < 0.35) {
+      install_scale <- 0.75
+      make_scale <- 0.60
+    }
+  } else {
+    if (available_ratio < 0.08) {
+      install_scale <- 0.25
+      make_scale <- 0.25
+    } else if (available_ratio < 0.15) {
+      install_scale <- 0.50
+      make_scale <- 0.35
+    } else if (available_ratio < 0.25) {
+      install_scale <- 0.75
+      make_scale <- 0.60
+    }
+  }
+
+  if (!is.na(swap_used_ratio)) {
+    if (swap_used_ratio >= 0.25) {
+      install_scale <- min(install_scale, 0.35)
+      make_scale <- min(make_scale, 0.25)
+    } else if (swap_used_ratio >= 0.10) {
+      install_scale <- min(install_scale, 0.60)
+      make_scale <- min(make_scale, 0.40)
+    } else if (swap_active) {
+      install_scale <- min(install_scale, if (mode == "shared_server") 0.75 else 0.85)
+      make_scale <- min(make_scale, if (mode == "shared_server") 0.50 else 0.65)
+    }
+  }
+
+  list(
+    available_ratio = available_ratio,
+    swap_used_ratio = swap_used_ratio,
+    swap_active = swap_active,
+    install_scale = install_scale,
+    make_scale = make_scale
+  )
 }
 
 cpu_budget_for_mode <- function(mode, state) {
@@ -241,7 +295,8 @@ resolve_dynamic_fetch <- function(manifest, package_count) {
   mode <- normalize_dynamic_mode(manifest_setting(manifest, "dynamic_mode", "shared_server"))
   state <- probe_host_state()
   cpu_budget <- cpu_budget_for_mode(mode, state)
-  scaled <- max(1L, round(cpu_budget * memory_scale_for_mode(mode, state)))
+  pressure <- host_pressure_for_mode(mode, state)
+  scaled <- max(1L, round(cpu_budget * pressure$install_scale))
   hard_cap <- if (mode == "shared_server") 12L else max(4L, min(24L, state$logical_cpus * 2L))
   initial <- min(as.integer(package_count), min(as.integer(hard_cap), as.integer(max(1L, scaled))))
   max_concurrency <- min(as.integer(package_count), as.integer(max(initial, hard_cap)))
@@ -261,24 +316,51 @@ resolve_install_runtime <- function(manifest, ready_count) {
   state <- probe_host_state()
   mode <- normalize_dynamic_mode(manifest_setting(manifest, "dynamic_mode", "shared_server"))
   cpu_budget <- cpu_budget_for_mode(mode, state)
-  mem_scale <- memory_scale_for_mode(mode, state)
+  pressure <- host_pressure_for_mode(mode, state)
   physical_cap <- max(1L, if (mode == "shared_server") state$physical_cpus - 1L else state$physical_cpus)
+  base_install_cap <- min(cpu_budget, physical_cap)
   install_ncpus <- min(
     as.integer(ready_count),
-    as.integer(max(1L, round(min(cpu_budget, physical_cap) * mem_scale)))
+    as.integer(max(1L, round(base_install_cap * pressure$install_scale)))
   )
-  batch_size <- if (mode == "shared_server") {
-    max(1L, min(as.integer(ready_count), install_ncpus))
+  healthy_host <- is.na(pressure$available_ratio) ||
+    (pressure$available_ratio >= if (mode == "shared_server") 0.35 else 0.25 &&
+     (is.na(pressure$swap_used_ratio) || pressure$swap_used_ratio < 0.10))
+  make_jobs_cap <- if (mode == "shared_server") {
+    max(1L, min(2L, install_ncpus))
   } else {
-    max(1L, min(as.integer(ready_count), install_ncpus + 1L))
+    if (healthy_host) {
+      max(1L, min(4L, install_ncpus + 2L))
+    } else {
+      max(1L, min(3L, install_ncpus + 1L))
+    }
   }
+  make_jobs <- max(1L, as.integer(round(make_jobs_cap * pressure$make_scale)))
+  chunk_cap <- if (mode == "shared_server") {
+    if (healthy_host) 2L else 1L
+  } else {
+    if (healthy_host) 4L else if (pressure$swap_active) 1L else 2L
+  }
+  batch_size <- max(
+    1L,
+    min(
+      as.integer(ready_count),
+      as.integer(max(1L, min(install_ncpus, chunk_cap)))
+    )
+  )
   list(
     install_ncpus = max(1L, as.integer(install_ncpus)),
-    make_jobs = max(1L, as.integer(install_ncpus)),
+    make_jobs = max(1L, as.integer(min(make_jobs, install_ncpus))),
     batch_size = max(1L, as.integer(batch_size)),
     host = state,
-    mode = mode
+    mode = mode,
+    pressure = pressure
   )
+}
+
+format_percent <- function(value) {
+  if (is.na(value)) return("n/a")
+  sprintf("%.0f%%", value * 100)
 }
 
 with_make_jobs <- function(make_jobs, code) {
@@ -325,11 +407,18 @@ install_layer_batches <- function(layer,
       packages = as.integer(length(batch)),
       threads = as.integer(runtime$install_ncpus),
       make_jobs = as.integer(runtime$make_jobs),
+      mem_available_ratio = if (!is.null(runtime$pressure)) runtime$pressure$available_ratio else NA_real_,
+      swap_used_ratio = if (!is.null(runtime$pressure)) runtime$pressure$swap_used_ratio else NA_real_,
       message = sprintf(
-        "installing batch of %d package(s) with Ncpus=%d MAKEFLAGS=-j%d",
+        paste0(
+          "installing batch of %d package(s) with Ncpus=%d MAKEFLAGS=-j%d",
+          " | mem_avail=%s swap_used=%s"
+        ),
         length(batch),
         runtime$install_ncpus,
-        runtime$make_jobs
+        runtime$make_jobs,
+        if (!is.null(runtime$pressure)) format_percent(runtime$pressure$available_ratio) else "n/a",
+        if (!is.null(runtime$pressure)) format_percent(runtime$pressure$swap_used_ratio) else "n/a"
       )
     )
 

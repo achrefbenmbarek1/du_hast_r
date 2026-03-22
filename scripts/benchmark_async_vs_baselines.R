@@ -411,7 +411,7 @@ write_du_hast_manifest <- function(path,
     make_jobs = 4L,
     lib = normalizePath(lib_dir, winslash = "/", mustWork = FALSE),
     cache_dir = normalizePath(cache_dir, winslash = "/", mustWork = FALSE),
-    repos = list()
+    repos = structure(list(), names = character())
   )
   dependencies <- as.list(rep("*", length(packages)))
   names(dependencies) <- packages
@@ -738,9 +738,9 @@ run_benchmark <- function(config, out_dir) {
 
           results[[idx]] <- result
           idx <- idx + 1L
+          write_results(results, out_dir, config)
 
           if (!isTRUE(result$ok) && isTRUE(config$stop_on_error)) {
-            write_results(results, out_dir, config)
             stop(sprintf("Benchmark aborted on first failure: %s", result$error_message), call. = FALSE)
           }
         }
