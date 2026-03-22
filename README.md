@@ -1,20 +1,14 @@
-# async_dependency_installer_for_R
+# du_hast_r
 
-Rust fetch/cache layer for an R dependency installer that separates:
+`du_hast_r` is a Rust-powered package manager for R with:
 
-- dependency graph planning in R
-- artifact download and cache reuse in Rust
-- install ordering and optional parallel install execution back in R
+- async artifact fetching and cache reuse
+- adaptive install scheduling
+- a lockfile-based CLI for reproducible project installs
 
-## What the Rust side does
+The lower-level Rust fetcher is still part of the repository and can be used directly, but the main product surface is the `du_hast_r` CLI.
 
-- downloads many package artifacts concurrently
-- caches artifacts by `URL + checksum`
-- verifies `sha256` or `md5` before persisting files
-- returns structured success or error data per package
-- supports multiple candidate URLs per package for mirror fallback
-
-## CLI contract
+## Fetcher contract
 
 Pass a JSON request on `stdin` or as the first positional argument. The response is emitted as JSON on `stdout`, or written to `--output <path>`.
 
@@ -208,28 +202,9 @@ Rscript scripts/demo_async_install.R BiocGenerics
 
 ## Benchmark harness
 
-This repository includes a benchmark runner for measuring async installer gains versus non-async baselines on heavy neurobiology-oriented stacks.
+This repository includes a benchmark runner for measuring `du_hast_r` against a tuned non-async baseline on realistic neurobiology-oriented stacks.
 
-Configured methods:
-
-- `async` (this project path, non-`turbo`)
-- `serial` baseline (`install.packages` one-by-one)
-- `tuned` baseline (`install.packages` with `Ncpus` + `MAKEFLAGS`)
-- `renv` baseline (`renv::restore`)
-
-Run a smoke benchmark first:
-
-```bash
-Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_smoke.json
-```
-
-Run the full benchmark:
-
-```bash
-Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config.json
-```
-
-Run the trimmed CLI dynamic benchmark against the real `du_hast_r gefragt` path:
+Run the general CLI dynamic benchmark:
 
 ```bash
 Rscript scripts/benchmark_async_vs_baselines.R scripts/benchmark_config_cli_dynamic.json
@@ -269,7 +244,6 @@ Rscript scripts/summarize_benchmark_results.R benchmark_runs/<run_id>/benchmark_
 
 Notes:
 
-- The benchmark runs cold and warm scenarios for each repetition.
 - Disk safety guard is controlled by `disk_guard.min_free_gb` in config.
 - Cleanup is sequential and enabled by default to reduce SSD pressure.
 - Results are checkpointed after each completed scenario, so partial runs still produce CSV/JSON output.
@@ -278,8 +252,6 @@ Notes:
 - Dynamic installs are chunked more finely than whole dependency layers, so `shared` and `dedicated` can raise or lower install parallelism more often between batches.
 - The dedicated mode now uses larger healthy-host install chunks and a higher healthy-host `MAKEFLAGS` cap than shared, while preserving the same low-memory backoff.
 - The single-cell CLI dynamic config models a more day-to-day computational neurobiology workflow than the Stan-heavy stress stack.
-- `renv` baseline requires the `renv` package to be installed.
-- Benchmark `renv` flows force `DOWNLOAD_STATIC_LIBV8=1` to avoid host-specific libv8 toolchain failures.
 
 ## Integration testing
 

@@ -9,7 +9,7 @@ source("R/async_install.R")
 }
 
 args <- commandArgs(trailingOnly = TRUE)
-config_path <- if (length(args) >= 1) args[[1]] else "scripts/benchmark_config.json"
+config_path <- if (length(args) >= 1) args[[1]] else "scripts/benchmark_config_cli_dynamic_singlecell_dedicated_confirm.json"
 out_dir <- if (length(args) >= 2) args[[2]] else file.path("benchmark_runs", format(Sys.time(), "%Y%m%d_%H%M%S"))
 
 if (!file.exists(config_path)) {
