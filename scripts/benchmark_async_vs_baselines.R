@@ -440,6 +440,7 @@ run_du_hast_cli <- function(packages, env_paths, cfg, dynamic_mode, log_path = N
   )
 
   args <- c(
+    "--no-tui",
     "gefragt",
     manifest_path,
     "--lockfile",

@@ -43,8 +43,8 @@ const RESOURCE_TICK: Duration = Duration::from_millis(800);
 struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
-    #[arg(long, global = true, help = "Render install progress in a full-screen terminal UI")]
-    tui: bool,
+    #[arg(long, global = true, help = "Disable the full-screen terminal UI and use plain CLI output")]
+    no_tui: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -485,7 +485,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
-    let tui = cli.tui;
+    let tui = !cli.no_tui;
 
     match cli.command {
         Commands::Init { manifest, force } => cmd_init(&manifest, force),

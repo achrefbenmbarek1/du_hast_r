@@ -84,13 +84,13 @@ Install from lockfile (`gefragt` is the install verb):
 du_hast_r gefragt fer.json
 ```
 
-Use full-screen TUI mode:
+Use plain CLI mode without the TUI:
 
 ```bash
-du_hast_r --tui gefragt fer.json
+du_hast_r --no-tui gefragt fer.json
 ```
 
-In TUI mode, press `q` to abort while running, and after success the 100% screen stays open until you press `q` to exit.
+By default, `du_hast_r gefragt` opens the full-screen TUI when stdout is an interactive terminal. In TUI mode, press `q` to abort while running, and after success the 100% screen stays open until you press `q` to exit.
 Command-mode shortcuts:
 - `f` then `p`: package panel regex search (by package name)
 - `f` then `l`: log panel regex search
@@ -103,7 +103,7 @@ Command-mode shortcuts:
 Show full compiler/install logs when needed:
 
 ```bash
-du_hast_r --verbose gefragt fer.json
+du_hast_r --no-tui --verbose gefragt fer.json
 ```
 
 Remove dependency from manifest (`nein` is the delete verb):
